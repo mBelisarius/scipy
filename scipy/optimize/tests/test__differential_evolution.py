@@ -22,6 +22,26 @@ from pytest import raises as assert_raises, warns
 import pytest
 
 
+def _rosen_shared(x):
+    # module-level (picklable) objective, reused as an objective-dependent
+    # constraint so process-based workers can pickle/send it.
+    return rosen(np.asarray(x))
+
+
+def _shared_metrics(x):
+    # module-level (picklable) expensive computation returning several metrics
+    x = np.asarray(x)
+    return {"loss": rosen(x), "budget": x[0] + x[1]}
+
+
+def _sel_loss(m):
+    return m["loss"]
+
+
+def _sel_budget(m):
+    return m["budget"]
+
+
 class TestDifferentialEvolutionSolver:
 
     def setup_method(self):
@@ -877,6 +897,161 @@ class TestDifferentialEvolutionSolver:
 
         assert constr_f(res.x) <= 1.9
         assert res.success
+
+    def test_constraint_objective_cache(self):
+        # When a constraint reuses the objective function (e.g. a
+        # NonlinearConstraint applied directly to the objective) the objective
+        # value should be computed once per parameter vector and shared between
+        # the constraint violation and population energy calculations, instead
+        # of being computed twice.
+        class Counter:
+            def __init__(self, f):
+                self.f = f
+                self.nfev = 0
+
+            def __call__(self, x):
+                x = np.asarray(x)
+                self.nfev += x.shape[1] if x.ndim == 2 else 1
+                return self.f(x)
+
+        bounds = [(0, 2), (0, 2)]
+        kwargs = dict(rng=4210919, maxiter=15, polish=False, tol=1e-7)
+
+        # objective reused as the constraint -> caching is active
+        obj = Counter(rosen)
+        nlc = NonlinearConstraint(obj, -np.inf, 1.9)
+        solver = DifferentialEvolutionSolver(
+            obj, bounds, constraints=(nlc,), **kwargs)
+        assert solver._objective_cache is not None
+        assert solver.func is solver._objective_cache
+        res_cached = solver.solve()
+
+        # baseline: the constraint uses a *separate* callable, so the objective
+        # cannot be shared and is evaluated once for the energy and once for
+        # the constraint.
+        obj_energy = Counter(rosen)
+        obj_constr = Counter(rosen)
+        nlc_b = NonlinearConstraint(obj_constr, -np.inf, 1.9)
+        solver_b = DifferentialEvolutionSolver(
+            obj_energy, bounds, constraints=(nlc_b,), **kwargs)
+        assert solver_b._objective_cache is None
+        res_base = solver_b.solve()
+
+        # identical rng/settings -> identical optimisation trajectory & result
+        assert_allclose(res_cached.x, res_base.x)
+        # caching removes the duplicated objective evaluations
+        baseline_total = obj_energy.nfev + obj_constr.nfev
+        assert obj.nfev < baseline_total
+
+    @pytest.mark.fail_slow(10)
+    def test_constraint_objective_cache_parallel(self):
+        # The objective-value caching for an objective-reusing constraint must
+        # also work when the objective is evaluated in worker processes
+        # (workers != 1), producing the same result as the serial computation.
+        bounds = [(0, 2), (0, 2)]
+        nlc = NonlinearConstraint(_rosen_shared, -np.inf, 1.9)
+        kwargs = dict(rng=4210919, maxiter=15, polish=False, tol=1e-7,
+                      updating='deferred')
+
+        solver = DifferentialEvolutionSolver(
+            _rosen_shared, bounds, constraints=(nlc,), workers=1, **kwargs)
+        assert solver._objective_cache is not None
+        res_serial = solver.solve()
+
+        with DifferentialEvolutionSolver(
+            _rosen_shared, bounds, constraints=(nlc,), workers=2, **kwargs
+        ) as solver_p:
+            assert solver_p._objective_cache is not None
+            res_parallel = solver_p.solve()
+
+        # identical (deterministic) trajectory -> identical result
+        assert_allclose(res_parallel.x, res_serial.x)
+        assert _rosen_shared(res_parallel.x) <= 1.9
+
+    def test_shared_function(self):
+        # SharedFunctionCache lets the objective and a constraint derive from
+        # one expensive computation, which is then evaluated only once per
+        # parameter vector and de-duplicated between the constraint and energy
+        # calculations.
+        from scipy.optimize import SharedFunctionCache
+
+        class MetricsCounter:
+            def __init__(self):
+                self.nfev = 0
+
+            def __call__(self, x):
+                self.nfev += 1
+                x = np.asarray(x)
+                return {"loss": rosen(x), "budget": x[0] + x[1]}
+
+        bounds = [(0, 2), (0, 2)]
+        kw = dict(rng=4210919, maxiter=12, polish=False, tol=1e-8,
+                  updating='deferred')
+
+        # shared: the expensive computation runs once per parameter vector
+        mc = MetricsCounter()
+        shared = SharedFunctionCache(mc)
+        obj = shared.objective(lambda m: m["loss"])
+        con = NonlinearConstraint(
+            shared.constraint(lambda m: m["budget"]), -np.inf, 2.5)
+        solver = DifferentialEvolutionSolver(
+            obj, bounds, constraints=(con,), workers=1, **kw)
+        assert solver._objective_cache is not None
+        res_shared = solver.solve()
+
+        # baseline: objective and constraint recompute the metrics independently
+        mc_o = MetricsCounter()
+        mc_c = MetricsCounter()
+        solver_b = DifferentialEvolutionSolver(
+            lambda x: mc_o(x)["loss"], bounds,
+            constraints=(NonlinearConstraint(
+                lambda x: mc_c(x)["budget"], -np.inf, 2.5),),
+            workers=1, **kw)
+        assert solver_b._objective_cache is None
+        res_base = solver_b.solve()
+
+        assert_allclose(res_shared.x, res_base.x, atol=1e-8)
+        # de-duplicated: fewer evaluations than objective + constraint separately
+        assert mc.nfev < mc_o.nfev + mc_c.nfev
+
+    @pytest.mark.fail_slow(10)
+    def test_shared_function_parallel(self):
+        # the shared computation must be de-duplicated and parallelised when
+        # process-based workers are used, giving the same result as serial.
+        from scipy.optimize import SharedFunctionCache
+
+        bounds = [(0, 2), (0, 2)]
+        kw = dict(rng=4210919, maxiter=12, polish=False, tol=1e-8,
+                  updating='deferred')
+
+        shared = SharedFunctionCache(_shared_metrics)
+        obj = shared.objective(_sel_loss)
+        con = NonlinearConstraint(shared.constraint(_sel_budget), -np.inf, 2.5)
+        res_serial = DifferentialEvolutionSolver(
+            obj, bounds, constraints=(con,), workers=1, **kw).solve()
+
+        shared_p = SharedFunctionCache(_shared_metrics)
+        obj_p = shared_p.objective(_sel_loss)
+        con_p = NonlinearConstraint(shared_p.constraint(_sel_budget), -np.inf, 2.5)
+        with DifferentialEvolutionSolver(
+            obj_p, bounds, constraints=(con_p,), workers=2, **kw
+        ) as sp:
+            res_parallel = sp.solve()
+
+        assert_allclose(res_parallel.x, res_serial.x)
+        assert _sel_budget(_shared_metrics(res_parallel.x)) <= 2.5 + 1e-8
+
+    def test_shared_function_errors(self):
+        from scipy.optimize import SharedFunctionCache
+
+        shared = SharedFunctionCache(_shared_metrics)
+        obj = shared.objective(_sel_loss)
+        # extra args must be baked into the wrapper, not passed via `args`
+        with assert_raises(ValueError):
+            differential_evolution(obj, [(0, 1), (0, 1)], args=(1,))
+        # not compatible with vectorized=True
+        with assert_raises(ValueError):
+            differential_evolution(obj, [(0, 1), (0, 1)], vectorized=True)
 
     @pytest.mark.fail_slow(10)
     def test_impossible_constraint(self):

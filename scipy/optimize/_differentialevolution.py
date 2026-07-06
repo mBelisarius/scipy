@@ -10,7 +10,8 @@ import numpy as np
 from scipy.optimize import OptimizeResult, minimize
 from scipy.optimize._constraints import (Bounds, new_bounds_to_old,
                                          NonlinearConstraint, LinearConstraint)
-from scipy.optimize._optimize import _status_message, _wrap_callback
+from scipy.optimize._optimize import (_status_message, _wrap_callback,
+                                      _SharedEvaluator, _SharedView)
 from scipy._lib._util import (check_random_state, MapWrapper, _FunctionWrapper,
                               rng_integers, _transition_to_rng)
 from scipy._lib._sparse import issparse
@@ -381,6 +382,20 @@ def differential_evolution(func, bounds, args=(), strategy='best1bin',
     ``'vectorized'`` may aid by only calling the objective function once per
     iteration, rather than multiple times for all the population members; the
     interpreter overhead is reduced.
+
+    Population energies are only calculated for members that satisfy the
+    ``constraints``, avoiding objective function evaluations for infeasible
+    members. In addition, if a `NonlinearConstraint` is applied directly to the
+    objective function (i.e. the constraint reuses the objective function
+    value), the objective function value is cached and shared between the
+    constraint violation and population energy calculations, so it is evaluated
+    only once per parameter vector instead of twice. When ``workers`` is used,
+    the objective function is evaluated for the whole population in parallel
+    before the constraint and energy calculations, so the shared value is
+    available to both regardless of the parallelization. More generally, when
+    the objective and constraints are derived from a single expensive
+    computation, wrap that computation with `SharedFunctionCache` so it is
+    evaluated only once per parameter vector.
 
     .. versionadded:: 0.15.0
 
@@ -820,6 +835,13 @@ class DifferentialEvolutionSolver:
         self.callback = _wrap_callback(callback, "differential_evolution")
         self.polish = polish
 
+        # Placeholder for a shared objective-function value cache. This is only
+        # created (further down) if a constraint reuses the objective function,
+        # in which case the objective value is computed once per parameter
+        # vector and shared between the constraint violation and population
+        # energy calculations. See `_ConstraintObjectiveCache`.
+        self._objective_cache = None
+
         # set the updating / parallelisation options
         if updating in ['immediate', 'deferred']:
             self._updating = updating
@@ -878,8 +900,34 @@ class DifferentialEvolutionSolver:
         # we create a wrapped function to allow the use of map (and Pool.map
         # in the future)
         self.original_func = func
-        self.func = _FunctionWrapper(func, args)
+        # `_raw_func` always evaluates the objective (used directly and via the
+        # map-like callable). `self.func` may be replaced below by a caching
+        # wrapper when a constraint reuses the objective function.
+        self._raw_func = _FunctionWrapper(func, args)
+        self.func = self._raw_func
         self.args = args
+
+        # `SharedFunctionCache` support: when the objective is a "view" over a
+        # shared expensive computation, evaluate that computation once per
+        # parameter vector (in parallel via `workers`) and derive both the
+        # objective and any constraint values from the cached result. See
+        # `_prepopulate_objective_cache` / `_energies_from_cache`.
+        if isinstance(func, _SharedView):
+            if args:
+                raise ValueError(
+                    "When the objective is created with `SharedFunctionCache`, "
+                    "the extra arguments must be baked into the wrapper; do not "
+                    "also pass `args`."
+                )
+            if self.vectorized:
+                raise ValueError(
+                    "`SharedFunctionCache` is not compatible with "
+                    "`vectorized=True`."
+                )
+            self._objective_cache = func._evaluator
+            self._objective_cache.objective_selector = func._selector
+            self.func = func
+            self._raw_func = func
 
         # convert tuple of lower and upper bounds to limits
         # [(low_0, high_0), ..., (low_n, high_n]
@@ -1006,14 +1054,45 @@ class DifferentialEvolutionSolver:
         if hasattr(constraints, '__len__'):
             # sequence of constraints, this will also deal with default
             # keyword parameter
-            for c in constraints:
-                self._wrapped_constraints.append(
-                    _ConstraintWrapper(c, self.x)
-                )
+            constraint_seq = constraints
         else:
-            self._wrapped_constraints = [
-                _ConstraintWrapper(constraints, self.x)
-            ]
+            constraint_seq = [constraints]
+
+        # If a constraint reuses the objective function (e.g. a
+        # `NonlinearConstraint` applied directly to the objective) then the
+        # objective would be evaluated twice per parameter vector: once when
+        # calculating the constraint violation and once when calculating the
+        # population energy. For expensive objective functions this doubles the
+        # cost. Memoize the objective so its value is computed only once per
+        # parameter vector and shared between both calculations. When `workers`
+        # is used the objective is pre-computed for the whole population via the
+        # map-like callable (in parallel) so the shared value is available to
+        # both calculations regardless of process boundaries (see
+        # `_prepopulate_objective_cache`).
+        #
+        # `self._objective_cache` may already be set if the objective is a
+        # `SharedFunctionCache` view (handled above); in that case the same
+        # pre-population/caching machinery is reused.
+        uses_objective = any(
+            getattr(c, 'fun', None) is func for c in constraint_seq
+        )
+        if uses_objective and self._objective_cache is None:
+            self._objective_cache = _ConstraintObjectiveCache(
+                func, args, maxsize=self.num_population_members
+            )
+            self.func = self._objective_cache
+
+        if self._objective_cache is not None:
+            self._objective_cache.maxsize = self.num_population_members
+
+        for c in constraint_seq:
+            self._wrapped_constraints.append(
+                _ConstraintWrapper(
+                    c, self.x,
+                    objective_fn=self._objective_cache,
+                    objective=func,
+                )
+            )
         self.total_constraints = np.sum(
             [c.num_constr for c in self._wrapped_constraints]
         )
@@ -1391,9 +1470,24 @@ class DifferentialEvolutionSolver:
         energies = np.full(num_members, np.inf)
 
         parameters_pop = self._scale_parameters(population)
+
+        if self._objective_cache is not None:
+            # A constraint reuses the objective function, so its value has
+            # already been computed for these parameter vectors (possibly in
+            # parallel via `workers`) when the constraint feasibility was
+            # calculated, and stored in the cache. Reuse those values instead
+            # of evaluating the objective again. Any (unexpectedly) missing
+            # values are evaluated via the map-like callable.
+            energies[0:S] = self._energies_from_cache(parameters_pop[0:S])
+            if self.vectorized:
+                self._nfev += 1
+            else:
+                self._nfev += S
+            return energies
+
         try:
             calc_energies = list(
-                self._mapwrapper(self.func, parameters_pop[0:S])
+                self._mapwrapper(self._raw_func, parameters_pop[0:S])
             )
             calc_energies = np.squeeze(calc_energies)
         except (TypeError, ValueError) as e:
@@ -1419,6 +1513,81 @@ class DifferentialEvolutionSolver:
             self._nfev += S
 
         return energies
+
+    def _energies_from_cache(self, parameters_pop):
+        """Read objective values for ``parameters_pop`` from the shared cache.
+
+        Any parameter vectors that are not present in the cache are evaluated
+        via the map-like callable (and stored). Returns an array of energies
+        with shape ``(len(parameters_pop),)``.
+        """
+        cache = self._objective_cache
+        S = np.size(parameters_pop, 0)
+        calc_energies = np.empty(S)
+        missing_idx = []
+        missing_keys = []
+        for i in range(S):
+            key = parameters_pop[i].tobytes()
+            try:
+                calc_energies[i] = cache.objective_from_raw(cache.cache[key])
+            except KeyError:
+                missing_idx.append(i)
+                missing_keys.append(key)
+
+        if missing_idx:
+            missing = parameters_pop[missing_idx]
+            raws = self._map_shared_function(missing)
+            for j, i in enumerate(missing_idx):
+                cache.store_raw(missing_keys[j], raws[j])
+                calc_energies[i] = cache.objective_from_raw(raws[j])
+
+        return calc_energies
+
+    def _prepopulate_objective_cache(self, parameters_pop):
+        """Evaluate the shared function for a whole population and cache results.
+
+        When a constraint reuses the objective function (or, more generally,
+        shares an expensive computation with it), the shared value is required
+        for every population member (to determine feasibility) as well as for
+        the population energies. Evaluating it here, through the map-like
+        callable, means the (potentially expensive) computation happens once per
+        parameter vector -- and in parallel when ``workers`` is used -- rather
+        than being computed serially inside the constraint and then again for
+        the energies.
+
+        Parameters
+        ----------
+        parameters_pop : ndarray
+            Scaled parameter vectors with shape ``(S, N)``.
+        """
+        cache = self._objective_cache
+        keys = [parameters_pop[i].tobytes()
+                for i in range(np.size(parameters_pop, 0))]
+        missing_idx = [i for i, k in enumerate(keys) if k not in cache.cache]
+        if not missing_idx:
+            return
+
+        missing = parameters_pop[missing_idx]
+        raws = self._map_shared_function(missing)
+        for j, i in enumerate(missing_idx):
+            cache.store_raw(keys[i], raws[j])
+
+    def _map_shared_function(self, parameters):
+        """Evaluate the cache's underlying function over ``parameters``.
+
+        Returns a sequence of raw results (one per row of ``parameters``), using
+        the map-like callable so that evaluation is parallelised when ``workers``
+        is used. The raw results may be scalars (objective-reusing constraint)
+        or arbitrary objects such as dicts/tuples (shared-function pattern).
+        """
+        cache = self._objective_cache
+        if self.vectorized:
+            # scalar objective only (the shared-function pattern is not used
+            # with `vectorized=True`); a single call returns an array (S,).
+            return np.atleast_1d(
+                np.squeeze(list(self._mapwrapper(cache.eval_one, parameters)))
+            )
+        return list(self._mapwrapper(cache.eval_one, parameters))
 
     def _promote_lowest_energy(self):
         # swaps 'best solution' into first population entry
@@ -1525,6 +1694,14 @@ class DifferentialEvolutionSolver:
         # (S, N)
         parameters_pop = self._scale_parameters(population)
 
+        if self._objective_cache is not None:
+            # A constraint reuses the objective function. Evaluate the
+            # objective for the whole population once (in parallel when
+            # `workers` is used) and cache it, so that both this constraint
+            # violation calculation and the subsequent population energy
+            # calculation reuse the same values instead of recomputing them.
+            self._prepopulate_objective_cache(parameters_pop)
+
         if self.vectorized:
             # (S, M)
             constraint_violation = np.array(
@@ -1609,6 +1786,12 @@ class DifferentialEvolutionSolver:
         fun : float
             Value of objective function obtained from the best solution.
         """
+        # If the objective function value is cached (shared with constraint
+        # evaluations), reset it each generation so that only within-generation
+        # sharing occurs and memory usage stays bounded.
+        if self._objective_cache is not None:
+            self._objective_cache.clear_cache()
+
         # the population may have just been initialized (all entries are
         # np.inf). If it has you have to calculate the initial energies
         if np.all(np.isinf(self.population_energies)):
@@ -1915,6 +2098,57 @@ class DifferentialEvolutionSolver:
         return idxs[idxs != candidate][:number_samples]
 
 
+class _ConstraintObjectiveCache(_SharedEvaluator):
+    """Cache an objective that is reused directly by a constraint.
+
+    When a constraint requires the objective function value (for example a
+    `NonlinearConstraint` applied directly to the objective function) the
+    objective would otherwise be evaluated twice per parameter vector: once
+    when the constraint violation is calculated and once when the population
+    energy is calculated. For an expensive objective function this doubles the
+    cost. Caching allows the objective to be evaluated only once per parameter
+    vector and shared between the two calculations.
+
+    This is the objective-reusing-constraint specialisation of
+    `_SharedEvaluator`: the cached value *is* the objective value (there is no
+    selector), and the object can be called directly as the objective (and as
+    the routed constraint), including with a vectorized ``(N, S)`` population.
+    The cache is intended to be cleared once per generation via `clear_cache`.
+    """
+
+    def __call__(self, x):
+        x = np.asarray(x)
+
+        if x.ndim <= 1:
+            # single parameter vector, shape (N,) -> scalar
+            return self.compute(x)
+
+        # vectorized input, shape (N, S) -> shape (S,). Only the parameter
+        # vectors that are not already cached are evaluated, and they are
+        # evaluated together in a single (vectorized) call to preserve the
+        # performance benefit of vectorization.
+        n_solutions = x.shape[1]
+        out = np.empty(n_solutions)
+        miss_keys = []
+        miss_cols = []
+        for j in range(n_solutions):
+            key = x[:, j].tobytes()
+            try:
+                out[j] = self.cache[key]
+                self.cache.move_to_end(key)
+            except KeyError:
+                miss_keys.append(key)
+                miss_cols.append(j)
+
+        if miss_cols:
+            values = np.atleast_1d(self.f(x[:, miss_cols], *self.args))
+            for k, j in enumerate(miss_cols):
+                out[j] = values[k]
+                self._store(miss_keys[k], values[k])
+
+        return out
+
+
 class _ConstraintWrapper:
     """Object to wrap/evaluate user defined constraints.
 
@@ -1946,13 +2180,21 @@ class _ConstraintWrapper:
     arrays of shape (N, S) or (N,), where S is the number of vectors of shape
     (N,) to consider constraints for.
     """
-    def __init__(self, constraint, x0):
+    def __init__(self, constraint, x0, *, objective_fn=None, objective=None):
         self.constraint = constraint
 
         if isinstance(constraint, NonlinearConstraint):
+            cfun = constraint.fun
+            if objective_fn is not None and cfun is objective:
+                # This constraint is applied to the objective function itself.
+                # Route it through the memoized objective so the objective
+                # value is only computed once per parameter vector (shared with
+                # the population energy calculation).
+                cfun = objective_fn
+
             def fun(x):
                 x = np.asarray(x)
-                return np.atleast_1d(constraint.fun(x))
+                return np.atleast_1d(cfun(x))
         elif isinstance(constraint, LinearConstraint):
             def fun(x):
                 if issparse(constraint.A):

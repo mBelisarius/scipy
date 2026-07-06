@@ -21,13 +21,14 @@ __all__ = ['fmin', 'fmin_powell', 'fmin_bfgs', 'fmin_ncg', 'fmin_cg',
            'fminbound', 'brent', 'golden', 'bracket', 'rosen', 'rosen_der',
            'rosen_hess', 'rosen_hess_prod', 'brute', 'approx_fprime',
            'line_search', 'check_grad', 'OptimizeResult', 'show_options',
-           'OptimizeWarning']
+           'OptimizeWarning', 'SharedFunctionCache']
 
 __docformat__ = "restructuredtext en"
 
 import math
 import warnings
 import sys
+from collections import OrderedDict
 from numpy import eye, argmin, zeros, shape, asarray, sqrt
 import numpy as np
 from scipy.linalg import cholesky, issymmetric, LinAlgError
@@ -39,7 +40,7 @@ from ._numdiff import approx_derivative
 from scipy._lib._util import getfullargspec_no_self as _getfullargspec
 from scipy._lib._util import (MapWrapper, check_random_state, _RichResult,
                               _call_callback_maybe_halt, _transition_to_rng,
-                              wrapped_inspect_signature)
+                              wrapped_inspect_signature, _FunctionWrapper)
 from scipy.optimize._differentiable_functions import ScalarFunction, FD_METHODS
 from scipy._lib._array_api import array_namespace, xp_capabilities, xp_promote
 from scipy._external import array_api_extra as xpx
@@ -83,6 +84,175 @@ class MemoizeJac:
     def derivative(self, x, *args):
         self._compute_if_needed(x, *args)
         return self.jac
+
+
+class _SharedEvaluator:
+    """Cache the full output of an expensive function keyed on the parameters.
+
+    Backs `SharedFunctionCache`. The expensive function is evaluated once per
+    (copied) parameter vector and its full output (e.g. a dict, tuple or array
+    of quantities) is cached. The objective and any constraints then obtain
+    their values by applying a cheap ``selector`` to the cached output (see
+    `_SharedView`), so the expensive computation is de-duplicated between them.
+
+    The cache is keyed on the raw bytes of the parameter vector and bounded to
+    ``maxsize`` entries using least-recently-used eviction. This object is
+    picklable so it can be sent to worker processes (used by
+    `differential_evolution` with ``workers``).
+    """
+
+    def __init__(self, f, args, objective_selector=None, maxsize=1024):
+        self.f = f
+        self.args = [] if args is None else args
+        self.objective_selector = objective_selector
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+        # plain evaluator (returns the full output) for a map-like callable.
+        self.eval_one = _FunctionWrapper(f, self.args)
+
+    def clear_cache(self):
+        self.cache.clear()
+
+    def _store(self, key, value):
+        cache = self.cache
+        cache[key] = value
+        cache.move_to_end(key)
+        maxsize = self.maxsize
+        if maxsize is not None:
+            while len(cache) > maxsize:
+                cache.popitem(last=False)
+
+    # --- generic cache interface (shared with other cache implementations) ---
+    def store_raw(self, key, value):
+        self._store(key, value)
+
+    def objective_from_raw(self, raw):
+        if self.objective_selector is None:
+            return raw
+        return self.objective_selector(raw)
+
+    def compute(self, x):
+        """Return the (cached) full output of the shared function at ``x``."""
+        x = np.asarray(x)
+        key = x.tobytes()
+        try:
+            value = self.cache[key]
+            self.cache.move_to_end(key)
+            return value
+        except KeyError:
+            value = self.f(x, *self.args)
+            self._store(key, value)
+            return value
+
+
+class _SharedView:
+    """A cheap selector over a `_SharedEvaluator`'s cached output.
+
+    Instances are used both as an optimizer objective and as the callable inside
+    a constraint. Calling the view evaluates the shared function once (via the
+    cache) and applies ``selector`` to its output.
+    """
+
+    def __init__(self, evaluator, selector):
+        self._evaluator = evaluator
+        self._selector = selector
+
+    def __call__(self, x):
+        return self._selector(self._evaluator.compute(x))
+
+
+class SharedFunctionCache:
+    """Share one expensive computation between an objective and constraints.
+
+    In constrained optimization it is common for the objective and one or more
+    constraints to be derived from a single expensive computation (for example a
+    physics model that returns several metrics, one of which is minimised while
+    others are constrained). Supplying the objective and constraints as
+    independent callables would evaluate that expensive computation multiple
+    times at the same parameter vector.
+
+    Wrapping the shared computation with this class makes the objective and each
+    constraint read from a single cache keyed on the parameter vector, so the
+    expensive computation is evaluated **once per parameter vector** and its
+    result is reused. This works with any optimizer that evaluates the objective
+    and constraints at the same point, including `minimize` (e.g. ``'SLSQP'``,
+    ``'trust-constr'``, ``'COBYLA'``, ``'COBYQA'``), `shgo` and
+    `differential_evolution`. With `differential_evolution` and ``workers`` the
+    shared computation is additionally evaluated for the whole population in
+    parallel.
+
+    Parameters
+    ----------
+    func : callable
+        The shared computation, called as ``func(x, *args)`` where ``x`` is a
+        1-D array of parameters. It may return any object (e.g. a dict, tuple or
+        array) from which the objective and constraint values are selected.
+    args : tuple, optional
+        Extra fixed arguments passed to ``func``. These are baked into the
+        wrapper; do **not** also pass ``args`` to the optimizer (an optimizer's
+        ``args`` is applied only to the objective, not to constraints, so baking
+        them here keeps every call site consistent).
+    maxsize : int, optional
+        Maximum number of cached results (least-recently-used eviction). The
+        default is usually adequate; `differential_evolution` sets it to the
+        population size automatically.
+
+    Notes
+    -----
+    The cached value is keyed on the parameter vector only, so ``func`` must be a
+    deterministic function of ``x`` (given the fixed ``args``).
+
+    .. versionadded:: 1.19.0
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from scipy.optimize import (minimize, NonlinearConstraint,
+    ...                             SharedFunctionCache)
+    >>> def metrics(x):
+    ...     # one expensive computation producing several outputs
+    ...     return {"loss": np.sum(x**2), "budget": np.sum(x)}
+    >>> shared = SharedFunctionCache(metrics)
+    >>> objective = shared.objective(lambda m: m["loss"])
+    >>> constraint = NonlinearConstraint(
+    ...     shared.constraint(lambda m: m["budget"]), -np.inf, 1.0)
+    >>> res = minimize(objective, [0.5, 0.5], method='SLSQP',
+    ...                constraints=[constraint])
+    """
+
+    def __init__(self, func, args=(), maxsize=1024):
+        self._evaluator = _SharedEvaluator(func, args, objective_selector=None,
+                                           maxsize=maxsize)
+
+    def objective(self, selector):
+        """Return the objective callable for the optimizer.
+
+        Parameters
+        ----------
+        selector : callable
+            Maps the output of the shared function to a scalar objective value.
+
+        Returns
+        -------
+        objective : callable
+            A callable ``objective(x)`` returning the scalar objective value.
+        """
+        return _SharedView(self._evaluator, selector)
+
+    def constraint(self, selector):
+        """Return a constraint callable (e.g. for `NonlinearConstraint`).
+
+        Parameters
+        ----------
+        selector : callable
+            Maps the output of the shared function to the constraint value(s).
+
+        Returns
+        -------
+        constraint : callable
+            A callable ``constraint(x)`` returning the constraint value(s).
+        """
+        return _SharedView(self._evaluator, selector)
 
 
 def _wrap_callback(callback, method=None):
