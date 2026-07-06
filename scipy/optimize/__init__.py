@@ -112,6 +112,7 @@ Global optimization
    basinhopping - Basinhopping stochastic optimizer.
    brute - Brute force searching optimizer.
    differential_evolution - Stochastic optimizer using differential evolution.
+   SharedFunctionCache - Share one computation between an objective and constraints.
 
    shgo - Simplicial homology global optimizer.
    dual_annealing - Dual annealing stochastic optimizer.
@@ -240,7 +241,7 @@ The `root` function supports the following methods:
    optimize.root-excitingmixing
    optimize.root-krylov
    optimize.root-dfsane
-   
+
 Elementwise Minimization and Root Finding
 =========================================
 

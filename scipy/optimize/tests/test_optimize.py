@@ -3614,3 +3614,96 @@ def test_multiprocessing_too_many_open_files_23080():
             _minimize_bfgs(rosen, x0, workers=p.map)
         del p
         del pool_obj
+
+
+class _Metrics:
+    """Counting expensive computation returning several shared quantities."""
+    def __init__(self):
+        self.nfev = 0
+
+    def __call__(self, x):
+        self.nfev += 1
+        x = np.asarray(x)
+        return {"loss": np.sum((x - 0.3) ** 2), "budget": np.sum(x ** 2)}
+
+
+class TestSharedFunctionCache:
+    # `SharedFunctionCache` lets the objective and a constraint derive from one
+    # expensive computation, which is then evaluated once per parameter vector
+    # instead of once for the objective and once for the constraint.
+
+    def test_evaluates_once_per_point(self):
+        m = _Metrics()
+        shared = optimize.SharedFunctionCache(m)
+        obj = shared.objective(lambda d: d["loss"])
+        con = shared.constraint(lambda d: d["budget"])
+
+        x = np.array([0.2, 0.5])
+        # the objective and constraint at the same point share one evaluation
+        assert obj(x) == np.sum((x - 0.3) ** 2)
+        assert con(x) == np.sum(x ** 2)
+        assert m.nfev == 1
+        # a different point triggers a new evaluation
+        con(np.array([0.4, 0.4]))
+        assert m.nfev == 2
+
+    def test_args_are_baked_in(self):
+        def f(x, offset):
+            return {"v": np.sum(x) + offset}
+
+        shared = optimize.SharedFunctionCache(f, args=(10.0,))
+        view = shared.objective(lambda d: d["v"])
+        assert view(np.array([1.0, 2.0])) == 13.0
+
+    def test_maxsize_eviction(self):
+        m = _Metrics()
+        shared = optimize.SharedFunctionCache(m, maxsize=1)
+        obj = shared.objective(lambda d: d["loss"])
+        obj(np.array([0.0, 0.0]))
+        obj(np.array([1.0, 1.0]))  # evicts the first entry
+        n_before = m.nfev
+        obj(np.array([0.0, 0.0]))  # recomputed because it was evicted
+        assert m.nfev == n_before + 1
+
+    @pytest.mark.parametrize("method", ["COBYLA", "SLSQP", "trust-constr"])
+    def test_minimize_dedup(self, method):
+        x0 = [0.8, 0.8]
+
+        shared_metrics = _Metrics()
+        shared = optimize.SharedFunctionCache(shared_metrics)
+        obj = shared.objective(lambda m: m["loss"])
+        con = NonlinearConstraint(
+            shared.constraint(lambda m: m["budget"]), -np.inf, 0.5)
+        res = optimize.minimize(obj, x0, method=method, constraints=[con])
+
+        # baseline: two independent callables, each recomputing the metrics
+        m_obj = _Metrics()
+        m_con = _Metrics()
+        con_b = NonlinearConstraint(lambda x: m_con(x)["budget"], -np.inf, 0.5)
+        res_b = optimize.minimize(lambda x: m_obj(x)["loss"], x0, method=method,
+                                  constraints=[con_b])
+
+        assert_allclose(res.x, res_b.x, atol=1e-4)
+        # sharing avoids recomputing the expensive metrics for the constraint
+        assert shared_metrics.nfev < m_obj.nfev + m_con.nfev
+
+    @pytest.mark.filterwarnings("ignore:overflow encountered")
+    @pytest.mark.filterwarnings("ignore:invalid value encountered")
+    def test_shgo_dedup(self):
+        bounds = [(0, 1), (0, 1)]
+
+        shared_metrics = _Metrics()
+        shared = optimize.SharedFunctionCache(shared_metrics)
+        obj = shared.objective(lambda m: m["loss"])
+        con = NonlinearConstraint(
+            shared.constraint(lambda m: m["budget"]), -np.inf, 0.5)
+        res = optimize.shgo(obj, bounds, constraints=[con], n=32, iters=1)
+
+        m_obj = _Metrics()
+        m_con = _Metrics()
+        con_b = NonlinearConstraint(lambda x: m_con(x)["budget"], -np.inf, 0.5)
+        res_b = optimize.shgo(lambda x: m_obj(x)["loss"], bounds,
+                              constraints=[con_b], n=32, iters=1)
+
+        assert_allclose(res.x, res_b.x, atol=1e-4)
+        assert shared_metrics.nfev < m_obj.nfev + m_con.nfev
